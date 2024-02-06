@@ -1,10 +1,6 @@
 # MIM Hack
-## background
- 
-Cauldrons are implemented BentoBox contracts.
-BentoBox is a vault for yield, it offers loan service, also flash-loans and it repays users with earned fees.
+## Background
 
-The Vault has a collateral token and a liquidity token that can be deposited
 In the codebase, borrow shares are referred to as `base`/part and borrow assets amounts are referred to as `elastic`/amount.
 
 The root cause of this exploit is a *precision loss bug* in the function responsible to calculate shares. The attacker drained MIM liquidity from the `yvCrv3Crypto` and `magicAPE` cauldrons, taking advantage of the incorrect debt calculation. Exploited CauldronV4 contracts:
@@ -32,7 +28,7 @@ Consider this function:
         }
     }
 ```
-when we can control the parameters of the formula that calculates `base`, we can trick the function to to perform calculations that results in a result that is not an integer, making solidity to discard the part after the comma.
+By controlling the parameters of the `base` calculation formula, it is possible to manipulate the function to produce non-integer results, causing Solidity to disregard the decimal portion.
 
 This function is called by DegenBox `toShare` function, that is responsible to calculate share of users based on token amount.
 ```
@@ -44,15 +40,11 @@ This function is called by DegenBox `toShare` function, that is responsible to c
         share = totals[token].toBase(amount, roundUp);
     }
 ```
-This function is both called from Cauldron in both `borrow` and `repay` functions.
+This function is called from Cauldron in both `borrow` and `repay` functions.
 
-In order to exploit the issue and make it profitable, the attacker first creates the situation where they can control such expression, it lower the base and elastic amount to 100 through repayForAll and repay.
-
-After the first stage the totalBorrow amounts are:
-- base: 3
-- elastic: 100
-
-at this point they lower base to zero repaying 1 wei a time. First round calculation:
+In order to exploit the issue and make it profitable, the attacker first creates the situation where they can control such formula, they lower the base and elastic amount to 100 through repayForAll and repay.
+Since this is not directly possible using a single call to repayForAll, they have to repay most of the debt, up to 1000 * 1e18 tokens, then manually repay users' debts until total value of base is 3 and elastic 100.
+At this point they lower base to zero repaying 1 wei a time. First round calculation:
 ```
 1 * 3 / 100 = 0.03
 ```
