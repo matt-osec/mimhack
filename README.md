@@ -1,17 +1,63 @@
 # MIM Hack
-## Background
+## Introduction
 
-In the codebase, borrow shares are referred to as `base`/part and borrow assets amounts are referred to as `elastic`/amount.
+Terminology:
 
-The root cause of this exploit is a *precision loss bug* in the function responsible to calculate shares. The attacker drained MIM liquidity from the `yvCrv3Crypto` and `magicAPE` cauldrons, taking advantage of the incorrect debt calculation. Exploited CauldronV4 contracts:
+- *base* / *part*: borrow shares
 
-- `yvCrv3Crypto` 0x7259e152103756e1616A77Ae982353c3751A6a90
+- *elastic* / *amount*: borrow assets
 
-- `magicAPE` 0x692887E8877C6Dd31593cda44c382DB5b289B684
+When a user borrows a certain amount of money, he will receive shares based on the current ratio of assets (`elastic`) and shares (`base`).  As interest is owed by the user, `elastic` will increase without increasing `base`, and this in turn will increase the proportional amount that the user has to pay back.
 
-## Root Cause
+Anyone can repay anyone debt through `repayForAll` function, or repay just for a single user calling `repay`.
 
-Consider this function:
+### Root Cause Analysis
+
+The root cause is a share deflation attack, made possible because the `repayForAll` function doesn't properly adjust the ratio between shares and assets. This leads to a specific situation where the attacker could borrow an arbitrary amount of tokens from the vault and then withdraw them, bypassing the health check.
+
+Here is `repayForAll` function and the important part:
+
+```
+    function repayForAll(uint128 amount, bool skim) public returns(uint128) {
+        
+        ...
+
+        uint128 previousElastic = totalBorrow.elastic;
+
+        require(previousElastic - amount > 1000 * 1e18, "Total Elastic too small");
+
+        totalBorrow.elastic = previousElastic - amount;
+
+        ...
+
+    }
+```
+
+As we can see it just subtracts the amount paid to `total.elastic` without adjusting the shares. In itself it is not a problem, it just depletes the value of users' shares.
+
+The following part of the attack is done thanks to this code:
+```
+    function toBase(
+        Rebase memory total,
+        uint256 elastic,
+        bool roundUp
+    ) internal pure returns (uint256 base) {
+        
+        ...
+        
+        } else {
+            base = (elastic * total.base) / total.elastic;
+            if (roundUp && (base * total.elastic) / total.base < elastic) {
+                base++;
+            }
+        }
+
+        ...
+```
+
+The attacker was able to first have `total.base = 98` and `total.elastic = 1`, in this way they can first inflate `total.base` value to make shares even more insignificant and have `total.elastic = 0`.
+
+This creates an edge case where, with some collateral, they could borrow and mint an arbitrary amount of tokens.
 ```
     function toBase(
         Rebase memory total,
@@ -21,72 +67,35 @@ Consider this function:
         if (total.elastic == 0) {
             base = elastic;
         } else {
-            base = (elastic * total.base) / total.elastic;
-            if (roundUp && (base * total.elastic) / total.base < elastic) {
-                base++;
-            }
+
+        ...
+
         }
     }
 ```
-By controlling the parameters of the `base` calculation formula, it is possible to manipulate the function to produce non-integer results, causing Solidity to disregard the decimal portion.
 
-This function is called by DegenBox `toShare` function, that is responsible to calculate share of users based on token amount.
-```
-    function toShare(
-        IERC20 token,
-        uint256 amount,
-        bool roundUp
-    ) external view returns (uint256 share) {
-        share = totals[token].toBase(amount, roundUp);
-    }
-```
-This function is called from Cauldron in both `borrow` and `repay` functions.
+As we can see, the branch should only be hit when there aren't borrowed tokens, however the function doesn't check if `total.base` is also zero, making this attack possible.
 
-In order to exploit the issue and make it profitable, the attacker first creates the situation where they can control such formula, they lower the base and elastic amount to 100 through repayForAll and repay.
-Since this is not directly possible using a single call to repayForAll, they have to repay most of the debt, up to 1000 * 1e18 tokens, then manually repay users' debts until total value of base is 3 and elastic 100.
-At this point they lower base to zero repaying 1 wei a time. First round calculation:
-```
-1 * 3 / 100 = 0.03
-```
-Second round:
-```
-1 * 2 / 99 = 0.03030303
-```
-Third round:
-```
-1 * 1 / 98 = 0.01020408
-```
-Since roundUp is true, the function will increase the result (base) by one, each time. Since we're repaying the base amount is lowered by one.
-At this point totalBorrow values are:
-- base: 0
-- elastic: 97
-
-After adding little amount of collateral (100), they can repeatly borrow 1 and repay 1, this would cause the precision loss to inflate a lot elastic value keeping base to 1.
-
-Using the same formula, we can see that each round the base rest the same (1) and elastic will roughly double each round:
-1. base 1, elastic 195
-2. base 1, elastic 389
-3. base 1, elastic 777
-4. base 1, elastic 1553
-
-and so on..
 
 ## Exploitation
 
-The exploitation strategy is divived in five steps:
+The exploitation happens in six steps:
 
-1. Flashloan MIM token with Degenbox
+1. Flashloan MIM to perform the attack
 
-2. deposit on Cauldron and repay most of the debt using repayForAll and repay to decrease base (shares) to zero and elastic (assets) lower than 100.
+2. Deposit on Cauldron and repay most of the debt using `repayForAll`, this would break the share ratio, then complete the share deflation manually repaying users' debt. The latter is also required because there's a check on `repayForAll` that prevents the elastic value from going below 1000 ether. At the end of this step the count of `total.base` count is 97 and `total.elastic` is 0.
 
-In order to empty the pool, the attacker uses repayForAll and repay functions, this creates the ideal situation to inflate the shares (base: 0, elastic: 97).
-It wasn't possible to do in a single call because there is a 'require' statement in `repayForAll` that prevents the elastic amount from being lowered to less than 1000 * 1e18.
+3. Deposit 3CRV LP tokens (collateral tokens for the vault), this would help following phases of the attack.
 
-3. Repeatedly borrow(1) and repay(1) to inflate the share price
+4. Attacker puts up 100 wei of collateral and repeatedly borrows 1 and repays 1. Due to the initial desync of the ratio, after many iterations there will be 1 `elastic` (assets) and very high amount of `base` (shares). This because borrowing 1 wei of asset will double the amount of shares every round. Since the protocol round in its favour, even if the repay amount is zero it will round to 1 letting the user repay 1 share. At the end they pay back the last 1 wei and the final situation `total.elastic` is zero and `total.base` is a very high number.
 
-4. Add collateral and borrow a large amount of MIM token
+5. Now the attacker can borrow funds, since the value of `elastic` is zero the system lets them mint the same amount of shares as assets. They can now withdraw the funds bypassing the health check because their shares are worth almost nothing. In particular, since `totalBorrow.base` is a big number and it is in the denominator it will shrink the borrowPart enough to pass the health check.
 
-5. Repay flashloan and take profit
+6. Once they have withdrawn the MIM tokens, they can repay the flashloan and get profit.
+
+## Fix
+
+In order to fix the issue, the edge case explained should be handled. It shouldn't be possible to mint arbitraty amount of token when the vault is not empty.
 
 ## References
 
